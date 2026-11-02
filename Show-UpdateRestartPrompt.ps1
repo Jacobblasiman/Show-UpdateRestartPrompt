@@ -33,7 +33,7 @@
 #>
 param([switch]$Preview)
 
-$ScriptVersion = '1.12'
+$ScriptVersion = '1.13'
 
 $ErrorActionPreference = 'Stop'
 
@@ -774,25 +774,66 @@ function Get-AccentColor {
     }
 }
 
+function Test-FutureRestartTime($Value) {
+    $when = ConvertFrom-UnixMilliseconds $Value
+    if (-not $when) { $when = ConvertTo-LocalDate $Value }
+    if ($when -and $when -gt (Get-Date) -and $when -lt (Get-Date).AddDays(35)) { return $when }
+    return $null
+}
+
 function Get-ScheduledUpdateRestart {
-    # A future time Windows has already committed to. The smart-scheduler prediction is not a schedule.
-    $names = @('ScheduledRebootTime', 'RebootScheduledTime', 'UserScheduledRebootTime', 'ScheduledRebootTimePoint')
-    $paths = @(
-        'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\StateVariables'
-        'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'
-        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator'
-        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\Reboot'
+    # A time the user picked in the Windows Update schedule menu, or a reboot task Windows has armed.
+    # SmartSchedulerPredicted* is only a guess, so it does not count.
+    $ignore = @(
+        'CurrentRebootRecognitionTime'
+        'IsCurrentRebootFeature'
+        'SmartSchedulerPredictedStartTimePoint'
+        'SmartSchedulerPredictedEndTimePoint'
+        'SmartSchedulerPredictedConfidence'
+        'RebootDowntimeEvaluation'
+        'DepOobeCompleteScheduler'
+        'PostUpdateOobeAppsScanScheduler'
     )
     $now = Get-Date
-    foreach ($path in $paths) {
-        if (-not (Test-Path -LiteralPath $path)) { continue }
-        $item = Get-ItemProperty -LiteralPath $path -ErrorAction SilentlyContinue
-        if (-not $item) { continue }
-        foreach ($property in $item.PSObject.Properties) {
-            if ($names -notcontains $property.Name -and $property.Name -notmatch '^(ScheduledReboot|RebootScheduled|UserScheduledReboot)') { continue }
-            $when = ConvertFrom-UnixMilliseconds $property.Value
-            if (-not $when) { $when = ConvertTo-LocalDate $property.Value }
-            if ($when -and $when -gt $now) { return $when }
+    $roots = @(
+        'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'
+        'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\StateVariables'
+        'HKCU:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator'
+    )
+    foreach ($root in $roots) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        $keys = @((Get-Item -LiteralPath $root))
+        $keys += @(Get-ChildItem -LiteralPath $root -Recurse -ErrorAction SilentlyContinue)
+        foreach ($key in $keys) {
+            $item = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue
+            if (-not $item) { continue }
+            foreach ($property in $item.PSObject.Properties) {
+                if ($property.Name -match '^(PS|$)') { continue }
+                if ($ignore -contains $property.Name) { continue }
+                $scheduledName = $property.Name -match '(?i)(schedul.*(reboot|restart)|(reboot|restart).*schedul|userreboot|committedreboot)'
+                $settingsRebootTime = ($key.PSPath -match '\\UX\\Settings') -and ($property.Name -match '(?i)reboot|restart') -and ($property.Name -notmatch '(?i)recognition|required|pending|activehours|notification')
+                if (-not $scheduledName -and -not $settingsRebootTime) { continue }
+                $asNumber = 0L
+                if ([int64]::TryParse([string]$property.Value, [ref]$asNumber) -and $asNumber -eq 1 -and $property.Name -match '(?i)schedul') {
+                    return 'the time you picked'
+                }
+                $when = Test-FutureRestartTime $property.Value
+                if ($when) { return $when }
+            }
+        }
+    }
+    $taskFiles = @(
+        (Join-Path $env:SystemRoot 'System32\Tasks\Microsoft\Windows\UpdateOrchestrator\Reboot')
+        (Join-Path $env:SystemRoot 'System32\Tasks\Microsoft\Windows\UpdateOrchestrator\Reboot_AC')
+        (Join-Path $env:SystemRoot 'System32\Tasks\Microsoft\Windows\UpdateOrchestrator\Reboot_Battery')
+    )
+    foreach ($taskFile in $taskFiles) {
+        if (-not (Test-Path -LiteralPath $taskFile)) { continue }
+        try { $xml = Get-Content -LiteralPath $taskFile -Raw -ErrorAction Stop } catch { continue }
+        foreach ($match in [regex]::Matches($xml, '<StartBoundary>([^<]+)</StartBoundary>')) {
+            $when = ConvertTo-LocalDate $match.Groups[1].Value
+            if ($when -and $when -gt $now -and $when -lt $now.AddDays(35)) { return $when }
         }
     }
     try {
