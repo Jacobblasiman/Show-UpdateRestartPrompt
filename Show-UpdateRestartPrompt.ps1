@@ -33,7 +33,7 @@
 #>
 param([switch]$Preview)
 
-$ScriptVersion = '1.15'
+$ScriptVersion = '1.16'
 
 $ErrorActionPreference = 'Stop'
 
@@ -786,9 +786,39 @@ function Test-FutureRestartTime($Value) {
     return $null
 }
 
+function Get-ScheduleMarkerPath { 'HKCU:\Software\UpdateRestartPrompt' }
+
+function Test-ScheduleMarker {
+    # Set when this user opens the Windows schedule page for the current pending restart.
+    $state = Get-WindowsRebootState
+    if (-not $state) { return $false }
+    $path = Get-ScheduleMarkerPath
+    if (-not (Test-Path -LiteralPath $path)) { return $false }
+    $saved = (Get-ItemProperty -LiteralPath $path -ErrorAction SilentlyContinue).RecognitionTime
+    if (-not $saved) { return $false }
+    return [string]$saved -eq $state.Recognized.ToString('o')
+}
+
+function Set-ScheduleMarker {
+    $state = Get-WindowsRebootState
+    if (-not $state) { return }
+    $path = Get-ScheduleMarkerPath
+    if (-not (Test-Path -LiteralPath $path)) { New-Item -Path $path -Force | Out-Null }
+    Set-ItemProperty -LiteralPath $path -Name RecognitionTime -Value $state.Recognized.ToString('o')
+}
+
 function Get-ScheduledUpdateRestart {
     # A time the user picked in the Windows Update schedule menu, or a reboot task Windows has armed.
     # SmartSchedulerPredicted* is only a guess, so it does not count.
+    $statePath = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\StateVariables'
+    if (Test-Path -LiteralPath $statePath) {
+        $state = Get-ItemProperty -LiteralPath $statePath -ErrorAction SilentlyContinue
+        if ($state -and $state.PSObject.Properties.Name -contains 'SmartSchedulerPredictedConfidence' -and [int]$state.SmartSchedulerPredictedConfidence -ge 100) {
+            $picked = ConvertFrom-UnixMilliseconds $state.SmartSchedulerPredictedStartTimePoint
+            if ($picked -and $picked -gt (Get-Date)) { return $picked }
+            return 'the time you picked'
+        }
+    }
     $ignore = @(
         'CurrentRebootRecognitionTime'
         'IsCurrentRebootFeature'
@@ -816,8 +846,10 @@ function Get-ScheduledUpdateRestart {
                 if ($property.Name -match '^(PS|$)') { continue }
                 if ($ignore -contains $property.Name) { continue }
                 if ($property.Name -match '(?i)SmartScheduler|Oobe|Downtime|Confidence|Recognition|ActiveHours|Notification') { continue }
+                $keyIsSchedule = $key.PSPath -match '(?i)\\(Reboot|Restart|Schedule)(\\|$)'
                 $scheduledName = $property.Name -match '(?i)schedul|reboot|restart'
-                if (-not $scheduledName) { continue }
+                $timeUnderScheduleKey = $keyIsSchedule -and $property.Name -match '(?i)^(Time|Start|End|StartTime|Date|Value|Data|Enabled)$'
+                if (-not $scheduledName -and -not $timeUnderScheduleKey) { continue }
                 $asNumber = 0L
                 if ([int64]::TryParse([string]$property.Value, [ref]$asNumber) -and $asNumber -eq 1 -and $property.Name -match '(?i)schedul') {
                     return 'the time you picked'
@@ -862,9 +894,13 @@ if (-not $Preview) {
         Write-Output 'OK: no update restart is pending, so the prompt was not shown'
         exit 0
     }
+    if (Test-ScheduleMarker) {
+        Write-Output 'OK: this pending restart was already sent to the Windows schedule page, so the prompt was not shown'
+        exit 0
+    }
     $scheduledRestart = Get-ScheduledUpdateRestart
     if ($scheduledRestart) {
-        Write-Output ('OK: a restart is already scheduled for {0:g}, so the prompt was not shown' -f $scheduledRestart)
+        Write-Output ('OK: a restart is already scheduled for {0}, so the prompt was not shown' -f $scheduledRestart)
         exit 0
     }
 }
@@ -1032,6 +1068,7 @@ try {
         $ui.ErrorText.Visibility = 'Collapsed'
         try {
             Open-SettingsPage 'ms-settings:windowsupdate-restartoptions'
+            Set-ScheduleMarker
         } catch {
             try { Open-SettingsPage 'ms-settings:windowsupdate' } catch { }
             Show-DialogError 'The schedule picker could not be opened directly. Use the arrow beside Restart now.'
