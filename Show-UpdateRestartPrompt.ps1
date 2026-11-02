@@ -33,7 +33,7 @@
 #>
 param([switch]$Preview)
 
-$ScriptVersion = '1.6'
+$ScriptVersion = '1.7'
 
 $ErrorActionPreference = 'Stop'
 
@@ -260,44 +260,66 @@ function Get-UpdateKind($Update) {
 }
 
 function Get-PendingRestartTime {
-    # Grace starts when the restart became pending. Use the earliest time Windows recorded for this boot.
-    $recorded = @()
+    # Grace starts when the restart became pending. A reboot that did not clear the pending
+    # state must not throw away the earlier timestamp, or the cutoff cannot be calculated.
     $boot = $null
     try { $boot = (Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime } catch { }
+    $explicit = @()
     $ux = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'
     if (Test-Path -LiteralPath $ux) {
-        $item = Get-ItemProperty -LiteralPath $ux
-        if ($item.PSObject.Properties.Name -contains 'PendingRebootStartTime') {
+        $item = Get-ItemProperty -LiteralPath $ux -ErrorAction SilentlyContinue
+        if ($item -and ($item.PSObject.Properties.Name -contains 'PendingRebootStartTime')) {
             $parsed = ConvertTo-LocalDate $item.PendingRebootStartTime
-            if ($parsed) { $recorded += $parsed }
+            if ($parsed) { $explicit += $parsed }
         }
     }
+    $markers = @()
     foreach ($path in @(
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\PackagesPending'
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Services\Pending'
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\RebootRequired'
+        'HKLM:\SOFTWARE\Microsoft\Updates\UpdateExeVolatile'
     )) {
-        if (Test-Path -LiteralPath $path) { $recorded += (Get-Item -LiteralPath $path).LastWriteTime }
+        if (Test-Path -LiteralPath $path) { $markers += (Get-Item -LiteralPath $path).LastWriteTime }
     }
+    $events = @()
     try {
-        $since = if ($boot) { $boot } else { (Get-Date).AddDays(-30) }
-        $events = @(Get-WinEvent -FilterHashtable @{
+        $found = @(Get-WinEvent -FilterHashtable @{
             LogName = 'Microsoft-Windows-WindowsUpdateClient/Operational'
             Id = 21, 22
-            StartTime = $since
+            StartTime = (Get-Date).AddDays(-45)
         } -ErrorAction Stop)
-        if ($events.Count -gt 0) {
-            $recorded += ($events | Sort-Object TimeCreated | Select-Object -First 1).TimeCreated
-        }
+        foreach ($event in $found) { $events += $event.TimeCreated }
     } catch { }
-    if ($boot) { $recorded = @($recorded | Where-Object { $_ -ge $boot.AddMinutes(-5) }) }
-    if ($recorded.Count -eq 0) { return $null }
-    $sorted = @($recorded | Sort-Object)
-    $earliest = $sorted[0]
-    $latest = $sorted[$sorted.Count - 1]
-    return @{ Time = $earliest; SpreadMinutes = ($latest - $earliest).TotalMinutes }
+
+    $afterBoot = @()
+    $beforeBoot = @()
+    foreach ($time in @($explicit + $markers + $events)) {
+        if (-not $time) { continue }
+        if ($boot -and $time -lt $boot.AddMinutes(-5)) { $beforeBoot += $time } else { $afterBoot += $time }
+    }
+    if ($afterBoot.Count -gt 0) {
+        $sorted = @($afterBoot | Sort-Object)
+        return @{ Time = $sorted[0]; SpreadMinutes = ($sorted[$sorted.Count - 1] - $sorted[0]).TotalMinutes; Note = $null }
+    }
+    if ($explicit.Count -gt 0) {
+        $start = @($explicit | Sort-Object)[0]
+        return @{ Time = $start; SpreadMinutes = 0; Note = ' This restart stayed pending through the last boot, so the cutoff is counted from when Windows first recorded it.' }
+    }
+    if ($markers.Count -gt 0) {
+        $sorted = @($markers | Sort-Object)
+        return @{ Time = $sorted[0]; SpreadMinutes = ($sorted[$sorted.Count - 1] - $sorted[0]).TotalMinutes; Note = ' This restart stayed pending through the last boot, so the cutoff is counted from when Windows wrote the pending-restart marker.' }
+    }
+    if ($beforeBoot.Count -gt 0) {
+        $start = @($beforeBoot | Sort-Object)[-1]
+        return @{ Time = $start; SpreadMinutes = 0; Note = ' The cutoff is counted from the last time Windows logged that a restart was required.' }
+    }
+    if ($boot) {
+        return @{ Time = $boot; SpreadMinutes = 0; Note = ' Windows did not record when the restart became pending, so the cutoff is counted from the last boot. If it became pending earlier, Windows can force the restart sooner.' }
+    }
+    return $null
 }
 
 function Get-EarliestOfferTime([datetime]$RestartTime, [int]$DeadlineDays) {
@@ -447,7 +469,8 @@ function Get-ForcedRestart {
     if ($unnamed) {
         $policyLine += ' The pending update was not named, so this is the soonest cutoff of the enforced policies.'
     }
-    if ($restart.SpreadMinutes -gt 2) {
+    if ($restart.Note) { $policyLine += $restart.Note }
+    elseif ($restart.SpreadMinutes -gt 2) {
         $policyLine += ' Windows recorded more than one start time; the earlier one is used.'
     }
     if ($noAutoReboot -and [int]$noAutoReboot.Value -eq 0) {
