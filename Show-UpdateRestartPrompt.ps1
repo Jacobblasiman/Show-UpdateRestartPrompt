@@ -33,6 +33,8 @@
 #>
 param([switch]$Preview)
 
+$ScriptVersion = '1.2'
+
 $ErrorActionPreference = 'Stop'
 
 # Relaunch into 64-bit Windows PowerShell on an STA thread. WPF needs STA, and a 32-bit host
@@ -279,6 +281,8 @@ $xaml = @'
           <TextBlock x:Name="BodyText" TextWrapping="Wrap" LineHeight="22"/>
           <TextBlock x:Name="ErrorText" Foreground="#C42B1C" TextWrapping="Wrap" Margin="0,12,0,0" Visibility="Collapsed"/>
         </StackPanel>
+        <TextBlock x:Name="VersionText" Grid.Row="0" HorizontalAlignment="Right" VerticalAlignment="Top"
+                   Margin="0,12,16,0" FontSize="12" Foreground="#9A9A9A" IsHitTestVisible="False"/>
 
         <Border x:Name="FooterBorder" Grid.Row="1" Background="#F3F3F3" BorderBrush="#E5E5E5" BorderThickness="0,1,0,0"
                 CornerRadius="0,0,7,7" Padding="16,14,20,14">
@@ -349,7 +353,7 @@ try {
 
     $window = [Windows.Markup.XamlReader]::Parse($xaml)
     $ui = @{}
-    foreach ($name in 'ShadowBorder', 'CardBorder', 'IconGlyph', 'TitleText', 'SubtitleText', 'BodyText', 'ErrorText', 'FooterBorder', 'NowBtn', 'ScheduleBtn', 'CloseBtn') {
+    foreach ($name in 'ShadowBorder', 'CardBorder', 'IconGlyph', 'TitleText', 'SubtitleText', 'BodyText', 'ErrorText', 'VersionText', 'FooterBorder', 'NowBtn', 'ScheduleBtn', 'CloseBtn') {
         $ui[$name] = $window.FindName($name)
     }
 
@@ -363,6 +367,8 @@ try {
     $ui.NowBtn.Background = $accentBrush
     $ui.NowBtn.BorderBrush = $accentBrush
     $ui.NowBtn.Foreground = $accentText
+    $ui.VersionText.Text = $ScriptVersion
+    $ui.VersionText.Foreground = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.Color]::FromRgb(154, 154, 154))
 
     if (-not $light) {
         $card = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.Color]::FromRgb(44, 44, 44))
@@ -379,6 +385,7 @@ try {
         $window.Foreground = $text
         $ui.TitleText.Foreground = $text
         $ui.SubtitleText.Foreground = $muted
+        $ui.VersionText.Foreground = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.Color]::FromRgb(184, 184, 184))
         $ui.BodyText.Foreground = $text
         foreach ($buttonName in 'ScheduleBtn', 'CloseBtn') {
             $ui[$buttonName].Background = $button
