@@ -12,9 +12,10 @@
     Current Windows 11 builds usually will not raise that dialog on demand. When it does not appear,
     this script shows a close copy with Restart now, Schedule restart, and Close.
 
-    Schedule restart opens the native scheduler (ms-settings:windowsupdate-restartoptions) when that
-    page is actually the day/time picker. Otherwise it opens Windows Update and tells the user to
-    open the arrow (caret) beside Restart now and choose Schedule restart.
+    The prompt appears at the bottom-right of the screen. Schedule restart opens the native
+    picker and turns this prompt into a closeable corner guide. The guide does not wait on
+    Settings and does not lock the screen. It explains the picker and tells the user to choose
+    a time when the PC will be on, awake, and online. The restart cannot be scheduled during downtime.
 
     Run in the signed-in user's session. Intune: "Run this script using the logged-on credentials" = Yes
     and "Run script in 64-bit PowerShell" = Yes. A restart happens only if the user clicks Restart now.
@@ -192,59 +193,6 @@ function Try-ShowNativeEngagedDialog {
     return $false
 }
 
-function Test-SettingsSchedulePicker {
-    # Looks for the native "Schedule the restart" page (Pick a day + Pick a time, or Schedule a time).
-    # Runs off the UI thread. A miss is treated as "the picker is not open".
-    $probe = [powershell]::Create()
-    [void]$probe.AddScript({
-        Add-Type -AssemblyName UIAutomationClient
-        function Get-SettingsLabels {
-            $root = [System.Windows.Automation.AutomationElement]::RootElement
-            $windowCondition = New-Object System.Windows.Automation.PropertyCondition(
-                [System.Windows.Automation.AutomationElement]::NameProperty, 'Settings')
-            $window = $root.FindFirst([System.Windows.Automation.TreeScope]::Children, $windowCondition)
-            if (-not $window) { return @() }
-            $text = New-Object System.Windows.Automation.PropertyCondition(
-                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-                [System.Windows.Automation.ControlType]::Text)
-            $combo = New-Object System.Windows.Automation.PropertyCondition(
-                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-                [System.Windows.Automation.ControlType]::ComboBox)
-            $either = New-Object System.Windows.Automation.OrCondition($text, $combo)
-            $elements = $window.FindAll([System.Windows.Automation.TreeScope]::Descendants, $either)
-            $labels = New-Object System.Collections.Generic.List[string]
-            foreach ($element in $elements) {
-                try {
-                    $name = [string]$element.Current.Name
-                    if ($name) { $labels.Add($name.Trim().ToLowerInvariant()) }
-                } catch { }
-            }
-            return $labels
-        }
-
-        foreach ($waitMs in 1500, 2000) {
-            Start-Sleep -Milliseconds $waitMs
-            $labels = @(Get-SettingsLabels)
-            $hasTime = $labels -contains 'pick a time'
-            $hasDay = $labels -contains 'pick a day'
-            $hasToggle = $labels -contains 'schedule a time'
-            if (($hasTime -and $hasDay) -or $hasToggle) { return $true }
-        }
-        return $false
-    })
-
-    $handle = $probe.BeginInvoke()
-    if (-not $handle.AsyncWaitHandle.WaitOne(8000)) {
-        try { $probe.Stop() } catch { }
-        $probe.Dispose()
-        return $false
-    }
-    $found = $false
-    try { $found = [bool]($probe.EndInvoke($handle) | Select-Object -Last 1) } catch { $found = $false }
-    $probe.Dispose()
-    return $found
-}
-
 function Open-SettingsPage([string]$Uri) {
     Start-Process $Uri | Out-Null
 }
@@ -252,8 +200,8 @@ function Open-SettingsPage([string]$Uri) {
 $xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Restart required" Width="560" SizeToContent="Height"
-        WindowStartupLocation="CenterScreen" WindowStyle="None" ResizeMode="NoResize"
+        Title="Restart required" Width="460" SizeToContent="Height"
+        WindowStartupLocation="Manual" WindowStyle="None" ResizeMode="NoResize"
         AllowsTransparency="True" Background="Transparent" Topmost="True" ShowInTaskbar="True"
         FontFamily="Segoe UI Variable Text, Segoe UI" FontSize="14" Foreground="#1A1A1A"
         UseLayoutRounding="True">
@@ -332,12 +280,12 @@ $xaml = @'
         </StackPanel>
 
         <Border x:Name="FooterBorder" Grid.Row="1" Background="#F3F3F3" BorderBrush="#E5E5E5" BorderThickness="0,1,0,0"
-                CornerRadius="0,0,7,7" Padding="20,16,28,16">
-          <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-            <Button x:Name="NowBtn" Content="Restart now" Style="{StaticResource AccentButton}" Margin="0"/>
-            <Button x:Name="ScheduleBtn" Content="Schedule restart" Style="{StaticResource DialogButton}"/>
-            <Button x:Name="CloseBtn" Content="Close" Style="{StaticResource DialogButton}" IsCancel="True"/>
-          </StackPanel>
+                CornerRadius="0,0,7,7" Padding="16,14,20,14">
+          <WrapPanel HorizontalAlignment="Right" Orientation="Horizontal">
+            <Button x:Name="NowBtn" Content="Restart now" Style="{StaticResource AccentButton}" Margin="0,4,0,0"/>
+            <Button x:Name="ScheduleBtn" Content="Schedule restart" Style="{StaticResource DialogButton}" Margin="8,4,0,0"/>
+            <Button x:Name="CloseBtn" Content="Close" Style="{StaticResource DialogButton}" Margin="8,4,0,0" IsCancel="True"/>
+          </WrapPanel>
         </Border>
       </Grid>
     </Border>
@@ -441,67 +389,51 @@ try {
     if ($Preview) {
         $ui.SubtitleText.Text = 'Preview only. Restart now will not restart this device.'
     }
-    $ui.BodyText.Text = 'To finish installing updates, this device needs to restart. Restart now, or schedule a restart for a time that works for you.'
+    $ui.BodyText.Text = 'To finish installing updates, this device needs to restart. Restart now, or schedule it for a time when this PC will be on, awake, and online.'
 
     $script:Choice = $null
-    $script:ScheduleMode = 'ask'
+    $script:OpenedPicker = $false
+
+    function Move-ToBottomRight {
+        $window.UpdateLayout()
+        $area = [System.Windows.SystemParameters]::WorkArea
+        $width = $window.ActualWidth
+        $height = $window.ActualHeight
+        if ($width -lt 1) { $width = $window.Width + 40 }
+        if ($height -lt 1) { $height = 360 }
+        $window.Left = [Math]::Max($area.Left, $area.Right - $width - 12)
+        $window.Top = [Math]::Max($area.Top, $area.Bottom - $height - 12)
+    }
 
     function Show-DialogError([string]$Message) {
         $ui.ErrorText.Text = $Message
         $ui.ErrorText.Visibility = 'Visible'
+        $window.Dispatcher.BeginInvoke([Action]{ Move-ToBottomRight }, [Windows.Threading.DispatcherPriority]::ApplicationIdle) | Out-Null
     }
 
     function Show-ScheduleGuide {
-        $ui.TitleText.Text = 'Schedule the restart'
+        $ui.TitleText.Text = 'How to use the picker'
+        $ui.SubtitleText.Text = 'Close this when you are done. It stays in the corner so you can still use the picker.'
         $ui.BodyText.Text = @(
-            'Windows Update is open.'
+            'The schedule picker is open.'
             ''
-            'The day and time picker did not open on its own. Schedule the restart from that page:'
-            '1. Select the small arrow (caret) beside Restart now.'
-            '2. Select Schedule restart. It may be labeled Pick a time.'
-            '3. Choose a day and time, then confirm.'
+            '1. Turn on Schedule a time if that switch is off.'
+            '2. Select Pick a day and choose the day.'
+            '3. Select Pick a time and choose the time.'
+            '4. Select Schedule restart if that button is shown. If it is not, the time is saved when both lists are set. Windows Update then shows the time you picked.'
+            ''
+            'Pick a time when this PC will be powered on, awake, and online. The restart cannot be scheduled during downtime. If the PC will be shut down, asleep, or unavailable, Windows will not finish the update then.'
+            ''
+            'If those lists are not on the page, select the arrow beside Restart now, then select Schedule restart, and follow the steps above.'
         ) -join [Environment]::NewLine
-        $ui.ScheduleBtn.Content = 'Open Windows Update'
-        $script:ScheduleMode = 'guide'
+        $ui.ScheduleBtn.Content = 'Show picker again'
+        $ui.ScheduleBtn.IsEnabled = $true
+        $ui.NowBtn.IsEnabled = $true
+        $ui.CloseBtn.IsEnabled = $true
+        $script:OpenedPicker = $true
+        # Stay in the corner, above the desktop, without taking over the picker.
         $window.Topmost = $true
-        $window.Dispatcher.BeginInvoke([Action]{
-            $window.UpdateLayout()
-            $area = [System.Windows.SystemParameters]::WorkArea
-            $window.Left = [Math]::Max($area.Left, $area.Right - $window.ActualWidth - 24)
-            $window.Top = [Math]::Max($area.Top, $area.Bottom - $window.ActualHeight - 24)
-            [void]$window.Activate()
-        }, [Windows.Threading.DispatcherPriority]::ApplicationIdle) | Out-Null
-    }
-
-    function Invoke-ScheduleRestart {
-        try {
-            try {
-                Open-SettingsPage 'ms-settings:windowsupdate-restartoptions'
-            } catch {
-                Show-DialogError 'Windows could not open restart options. Opening Windows Update instead.'
-                try { Open-SettingsPage 'ms-settings:windowsupdate' } catch { }
-                Show-ScheduleGuide
-                return
-            }
-
-            # Both labels together mean the native day/time page is up. Either label alone can
-            # appear in ordinary Windows Update text, so that does not count.
-            if (Test-SettingsSchedulePicker) {
-                $script:Choice = 'NativeSchedule'
-                $window.Close()
-                return
-            }
-
-            try { Open-SettingsPage 'ms-settings:windowsupdate' } catch {
-                Show-DialogError 'Windows Update could not be opened. Open Settings, then Windows Update, and use the steps below.'
-            }
-            Show-ScheduleGuide
-        } catch {
-            Show-DialogError 'The schedule page could not be opened. Use the arrow beside Restart now on the Windows Update page.'
-            Show-ScheduleGuide
-        } finally {
-            if ($script:ScheduleMode -eq 'guide') { $ui.ScheduleBtn.IsEnabled = $true }
-        }
+        $window.Dispatcher.BeginInvoke([Action]{ Move-ToBottomRight }, [Windows.Threading.DispatcherPriority]::ApplicationIdle) | Out-Null
     }
 
     $ui.NowBtn.Add_Click({
@@ -530,20 +462,14 @@ try {
     })
 
     $ui.ScheduleBtn.Add_Click({
-        if ($script:ScheduleMode -eq 'guide') {
-            try {
-                Open-SettingsPage 'ms-settings:windowsupdate'
-                $ui.ErrorText.Visibility = 'Collapsed'
-            } catch {
-                Show-DialogError 'Windows Update could not be opened. Open Settings and select Windows Update.'
-            }
-            return
-        }
-        # Paint "Opening..." before the picker check blocks this thread.
         $ui.ErrorText.Visibility = 'Collapsed'
-        $ui.ScheduleBtn.IsEnabled = $false
-        $ui.ScheduleBtn.Content = 'Opening...'
-        $window.Dispatcher.BeginInvoke([Action]{ Invoke-ScheduleRestart }, [Windows.Threading.DispatcherPriority]::Background) | Out-Null
+        try {
+            Open-SettingsPage 'ms-settings:windowsupdate-restartoptions'
+        } catch {
+            try { Open-SettingsPage 'ms-settings:windowsupdate' } catch { }
+            Show-DialogError 'The schedule picker could not be opened directly. Use the arrow beside Restart now.'
+        }
+        Show-ScheduleGuide
     })
 
     $ui.CloseBtn.Add_Click({
@@ -552,7 +478,12 @@ try {
     })
 
     $window.Add_MouseLeftButtonDown({ try { $window.DragMove() } catch { } })
-    $window.Add_Loaded({ [void]$window.Activate(); [void]$ui.CloseBtn.Focus() })
+    $window.Add_Loaded({
+        Move-ToBottomRight
+        [void]$window.Activate()
+        [void]$ui.CloseBtn.Focus()
+    })
+    $window.Add_ContentRendered({ Move-ToBottomRight })
     $window.Add_Closing({ if (-not $script:Choice) { $script:Choice = 'Close' } })
 
     [void]$window.ShowDialog()
@@ -562,8 +493,13 @@ try {
             if ($Preview) { Write-Output 'Preview: Restart now was clicked. The device was not restarted.' }
             else { Write-Output 'Restart now: the user restarted to finish installing updates' }
         }
-        'NativeSchedule' { Write-Output 'Schedule restart: opened the native restart options page' }
-        'Close' { Write-Output 'Closed: the user dismissed the prompt. It will show again on the next run while a restart is still required.' }
+        'Close' {
+            if ($script:OpenedPicker) {
+                Write-Output 'Schedule restart: opened the picker. The corner guide was then closed.'
+            } else {
+                Write-Output 'Closed: the user dismissed the prompt. It will show again on the next run while a restart is still required.'
+            }
+        }
         default { Write-Output 'Closed: the prompt was dismissed' }
     }
     exit 0
