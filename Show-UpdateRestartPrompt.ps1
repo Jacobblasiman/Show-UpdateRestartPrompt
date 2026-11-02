@@ -33,7 +33,7 @@
 #>
 param([switch]$Preview)
 
-$ScriptVersion = '1.8'
+$ScriptVersion = '1.9'
 
 $ErrorActionPreference = 'Stop'
 
@@ -259,7 +259,42 @@ function Get-UpdateKind($Update) {
     return 'Other'
 }
 
+function ConvertFrom-UnixMilliseconds($Value) {
+    if ($null -eq $Value -or [string]$Value -eq '') { return $null }
+    $number = 0L
+    if (-not [int64]::TryParse(([string]$Value).Trim(), [ref]$number)) { return $null }
+    # Windows stores these UX times as Unix milliseconds, not FILETIME.
+    if ($number -lt 1000000000000) { return $null }
+    try { return [DateTimeOffset]::FromUnixTimeMilliseconds($number).LocalDateTime } catch { return $null }
+}
+
+function Get-WindowsRebootState {
+    # Windows records the current pending restart here. IsCurrentRebootFeature 0 is a quality update.
+    $path = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\StateVariables'
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    $state = Get-ItemProperty -LiteralPath $path -ErrorAction SilentlyContinue
+    if (-not $state -or ($state.PSObject.Properties.Name -notcontains 'CurrentRebootRecognitionTime')) { return $null }
+    $recognized = ConvertFrom-UnixMilliseconds $state.CurrentRebootRecognitionTime
+    if (-not $recognized) { return $null }
+    $kind = 'Quality'
+    if ($state.PSObject.Properties.Name -contains 'IsCurrentRebootFeature' -and [int]$state.IsCurrentRebootFeature -ne 0) {
+        $kind = 'Feature'
+    }
+    return @{ Recognized = $recognized; Kind = $kind }
+}
+
 function Get-PendingRestartTime {
+    # The Update session stores the real start of this pending restart. Prefer that over any estimate.
+    $windowsState = Get-WindowsRebootState
+    if ($windowsState) {
+        return @{
+            Time = $windowsState.Recognized
+            SpreadMinutes = 0
+            Note = $null
+            Authoritative = $true
+            Kind = $windowsState.Kind
+        }
+    }
     # Grace starts when the restart became pending. A reboot that did not clear the pending
     # state must not throw away the earlier timestamp, or the cutoff cannot be calculated.
     $boot = $null
@@ -392,9 +427,28 @@ function Get-ForcedRestart {
         return @{ Text = 'Windows did not record when this restart became pending, so the forced-restart time is not shown.' }
     }
 
-    $updates = @(Get-RebootRequiredUpdates)
+    $updates = @()
     $bindings = @()
     $unnamed = $false
+    if ($restart.Authoritative) {
+        $kind = $restart.Kind
+        $deadlinePolicy = if ($kind -eq 'Feature') { $featureDeadline } else { $qualityDeadline }
+        $gracePolicy = if ($kind -eq 'Feature') { $featureGrace } else { $qualityGrace }
+        if ($deadlinePolicy -and $gracePolicy) {
+            $deadlineDays = [int]$deadlinePolicy.Value
+            $graceDays = [int]$gracePolicy.Value
+            $graceEnd = $restart.Time.AddDays($graceDays)
+            $offer = $null
+            if ($graceDays -lt $deadlineDays) { $offer = Get-EarliestOfferTime $restart.Time $deadlineDays }
+            if ($offer -and $offer.AddDays($deadlineDays) -gt $graceEnd) {
+                $bindings += @{ Effective = $offer.AddDays($deadlineDays); Start = $offer; Days = $deadlineDays; Kind = $kind; DeadlineDays = $deadlineDays; GraceDays = $graceDays; Source = $deadlinePolicy.Source; FromWindows = $true }
+            } else {
+                $bindings += @{ Effective = $graceEnd; Start = $restart.Time; Days = $graceDays; Kind = $kind; DeadlineDays = $deadlineDays; GraceDays = $graceDays; Source = $gracePolicy.Source; FromWindows = $true }
+            }
+        }
+    } else {
+        $updates = @(Get-RebootRequiredUpdates)
+    }
     foreach ($update in $updates) {
         $kind = Get-UpdateKind $update
         if ($kind -eq 'Driver') { continue }
@@ -474,6 +528,9 @@ function Get-ForcedRestart {
     $when = '{0} at {1}' -f $binding.Effective.ToString('dddd, MMMM d, yyyy'), $binding.Effective.ToString('t')
     $kindName = if ($binding.Kind -eq 'Feature') { 'feature' } else { 'quality' }
     $policyLine = '{0} is enforcing a {1}-day {2}-update deadline and a {3}-day grace period. The cutoff is the later of those two clocks.' -f $binding.Source, $binding.DeadlineDays, $kindName, $binding.GraceDays
+    if ($binding.FromWindows -and $binding.Start -eq $restart.Time) {
+        $policyLine = 'Windows recorded this {0}-update restart at {1}. {2} adds a {3}-day grace period. That is the forced-restart time Windows shows.' -f $kindName, $restart.Time.ToString('g'), $binding.Source, $binding.GraceDays
+    }
     if ($unnamed) {
         $policyLine += ' The pending update was not named, so this is the soonest cutoff of the enforced policies.'
     }
