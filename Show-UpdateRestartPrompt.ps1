@@ -33,7 +33,7 @@
 #>
 param([switch]$Preview)
 
-$ScriptVersion = '1.10'
+$ScriptVersion = '1.11'
 
 $ErrorActionPreference = 'Stop'
 
@@ -526,26 +526,13 @@ function Get-ForcedRestart {
         $fraction = [Math]::Min(1.0, [Math]::Max(0.0, $elapsed.TotalSeconds / $length.TotalSeconds))
     }
     $when = '{0} at {1}' -f $binding.Effective.ToString('dddd, MMMM d, yyyy'), $binding.Effective.ToString('t')
-    $kindName = if ($binding.Kind -eq 'Feature') { 'feature' } else { 'quality' }
-    $policyLine = '{0} is enforcing a {1}-day {2}-update deadline and a {3}-day grace period. The cutoff is the later of those two clocks.' -f $binding.Source, $binding.DeadlineDays, $kindName, $binding.GraceDays
-    if ($unnamed) {
-        $policyLine += ' The pending update was not named, so this is the soonest cutoff of the enforced policies.'
-    }
-    if ($restart.Note) { $policyLine += $restart.Note }
-    elseif ($restart.SpreadMinutes -gt 2) {
-        $policyLine += ' Windows recorded more than one start time; the earlier one is used.'
-    }
-    if ($noAutoReboot -and [int]$noAutoReboot.Value -eq 0) {
-        $policyLine += ' Windows may still restart outside active hours before that cutoff.'
-    }
     if ($remaining.TotalSeconds -le 0) {
-        $text = "The enforced cutoff was $when. That time has passed, so Windows can force the restart at any time.`r`n$policyLine"
+        $text = "The enforced cutoff was $when. That time has passed, so Windows can force the restart at any time."
         $fraction = 1.0
     } else {
         $text = @"
 Windows will force the restart on $when.
 $(Format-Duration $remaining) remaining. $(Format-Duration $elapsed) of the $(Format-Duration $length) enforced window has passed.
-$policyLine
 "@.Trim()
     }
     return @{ Text = $text; Fraction = $fraction }
