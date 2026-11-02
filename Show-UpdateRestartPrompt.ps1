@@ -33,7 +33,7 @@
 #>
 param([switch]$Preview)
 
-$ScriptVersion = '1.13'
+$ScriptVersion = '1.14'
 
 $ErrorActionPreference = 'Stop'
 
@@ -775,9 +775,14 @@ function Get-AccentColor {
 }
 
 function Test-FutureRestartTime($Value) {
-    $when = ConvertFrom-UnixMilliseconds $Value
+    $when = $null
+    if ($Value -is [byte[]] -and ($Value.Length -eq 8 -or $Value.Length -eq 16)) {
+        try { $when = [datetime]::FromFileTime([BitConverter]::ToInt64($Value, 0)) } catch { $when = $null }
+    }
+    if (-not $when) { $when = ConvertFrom-UnixMilliseconds $Value }
     if (-not $when) { $when = ConvertTo-LocalDate $Value }
-    if ($when -and $when -gt (Get-Date) -and $when -lt (Get-Date).AddDays(35)) { return $when }
+    $now = Get-Date
+    if ($when -and $when -gt $now -and $when -lt $now.AddDays(35)) { return $when }
     return $null
 }
 
@@ -796,10 +801,9 @@ function Get-ScheduledUpdateRestart {
     )
     $now = Get-Date
     $roots = @(
-        'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'
-        'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\StateVariables'
-        'HKCU:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'
-        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator'
+        'HKLM:\SOFTWARE\Microsoft\WindowsUpdate'
+        'HKCU:\SOFTWARE\Microsoft\WindowsUpdate'
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate'
     )
     foreach ($root in $roots) {
         if (-not (Test-Path -LiteralPath $root)) { continue }
@@ -811,9 +815,9 @@ function Get-ScheduledUpdateRestart {
             foreach ($property in $item.PSObject.Properties) {
                 if ($property.Name -match '^(PS|$)') { continue }
                 if ($ignore -contains $property.Name) { continue }
-                $scheduledName = $property.Name -match '(?i)(schedul.*(reboot|restart)|(reboot|restart).*schedul|userreboot|committedreboot)'
-                $settingsRebootTime = ($key.PSPath -match '\\UX\\Settings') -and ($property.Name -match '(?i)reboot|restart') -and ($property.Name -notmatch '(?i)recognition|required|pending|activehours|notification')
-                if (-not $scheduledName -and -not $settingsRebootTime) { continue }
+                if ($property.Name -match '(?i)SmartScheduler|Oobe|Downtime|Confidence|Recognition|ActiveHours|Notification') { continue }
+                $scheduledName = $property.Name -match '(?i)schedul|reboot|restart'
+                if (-not $scheduledName) { continue }
                 $asNumber = 0L
                 if ([int64]::TryParse([string]$property.Value, [ref]$asNumber) -and $asNumber -eq 1 -and $property.Name -match '(?i)schedul') {
                     return 'the time you picked'
@@ -845,6 +849,15 @@ function Get-ScheduledUpdateRestart {
             }
         }
     } catch { }
+    foreach ($taskName in @('\Microsoft\Windows\UpdateOrchestrator\Reboot', '\Microsoft\Windows\UpdateOrchestrator\Reboot_AC', '\Microsoft\Windows\UpdateOrchestrator\Reboot_Battery')) {
+        $query = & "$env:SystemRoot\System32\schtasks.exe" /Query /TN $taskName /FO LIST /V 2>$null
+        if (-not $query) { continue }
+        foreach ($line in $query) {
+            if ($line -notmatch '(?i)Next Run Time:\s*(.+)$') { continue }
+            $when = ConvertTo-LocalDate $Matches[1].Trim()
+            if ($when -and $when -gt $now -and $when.Year -lt 2100) { return $when }
+        }
+    }
     return $null
 }
 
