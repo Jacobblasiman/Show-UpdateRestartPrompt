@@ -33,7 +33,7 @@
 #>
 param([switch]$Preview)
 
-$ScriptVersion = '1.2'
+$ScriptVersion = '1.3'
 
 $ErrorActionPreference = 'Stop'
 
@@ -203,7 +203,7 @@ function Open-SettingsPage([string]$Uri) {
 $xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Restart required" Width="460" SizeToContent="Height"
+        Title="Restart required" Width="520" SizeToContent="Height"
         WindowStartupLocation="Manual" WindowStyle="None" ResizeMode="NoResize"
         AllowsTransparency="True" Background="Transparent" Topmost="True" ShowInTaskbar="True"
         FontFamily="Segoe UI Variable Text, Segoe UI" FontSize="14" Foreground="#1A1A1A"
@@ -214,10 +214,10 @@ $xaml = @'
       <Setter Property="Foreground" Value="#1A1A1A"/>
       <Setter Property="BorderBrush" Value="#CCCCCC"/>
       <Setter Property="BorderThickness" Value="1"/>
-      <Setter Property="Padding" Value="16,7"/>
-      <Setter Property="MinWidth" Value="120"/>
+      <Setter Property="Padding" Value="10,7"/>
       <Setter Property="MinHeight" Value="32"/>
-      <Setter Property="Margin" Value="8,0,0,0"/>
+      <Setter Property="HorizontalAlignment" Value="Stretch"/>
+      <Setter Property="HorizontalContentAlignment" Value="Center"/>
       <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
       <Setter Property="Template">
         <Setter.Value>
@@ -285,12 +285,17 @@ $xaml = @'
                    Margin="0,12,16,0" FontSize="12" Foreground="#9A9A9A" IsHitTestVisible="False"/>
 
         <Border x:Name="FooterBorder" Grid.Row="1" Background="#F3F3F3" BorderBrush="#E5E5E5" BorderThickness="0,1,0,0"
-                CornerRadius="0,0,7,7" Padding="16,14,20,14">
-          <WrapPanel HorizontalAlignment="Right" Orientation="Horizontal">
-            <Button x:Name="NowBtn" Content="Restart now" Style="{StaticResource AccentButton}" Margin="0,4,0,0"/>
-            <Button x:Name="ScheduleBtn" Content="Schedule restart" Style="{StaticResource DialogButton}" Margin="8,4,0,0"/>
-            <Button x:Name="CloseBtn" Content="Close" Style="{StaticResource DialogButton}" Margin="8,4,0,0" IsCancel="True"/>
-          </WrapPanel>
+                CornerRadius="0,0,7,7" Padding="16,14">
+          <Grid>
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="*"/>
+              <ColumnDefinition Width="*"/>
+              <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <Button x:Name="NowBtn" Grid.Column="0" Content="Restart now" Style="{StaticResource AccentButton}" Margin="0,0,8,0"/>
+            <Button x:Name="ScheduleBtn" Grid.Column="1" Content="Schedule restart" Style="{StaticResource DialogButton}" Margin="0,0,8,0"/>
+            <Button x:Name="CloseBtn" Grid.Column="2" Content="Close" Style="{StaticResource DialogButton}" Margin="0" IsCancel="True"/>
+          </Grid>
         </Border>
       </Grid>
     </Border>
