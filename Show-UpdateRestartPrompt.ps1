@@ -33,7 +33,7 @@
 #>
 param([switch]$Preview)
 
-$ScriptVersion = '1.16'
+$ScriptVersion = '1.17'
 
 $ErrorActionPreference = 'Stop'
 
@@ -786,30 +786,41 @@ function Test-FutureRestartTime($Value) {
     return $null
 }
 
-function Get-ScheduleMarkerPath { 'HKCU:\Software\UpdateRestartPrompt' }
-
-function Test-ScheduleMarker {
-    # Set when this user opens the Windows schedule page for the current pending restart.
-    $state = Get-WindowsRebootState
-    if (-not $state) { return $false }
-    $path = Get-ScheduleMarkerPath
-    if (-not (Test-Path -LiteralPath $path)) { return $false }
-    $saved = (Get-ItemProperty -LiteralPath $path -ErrorAction SilentlyContinue).RecognitionTime
-    if (-not $saved) { return $false }
-    return [string]$saved -eq $state.Recognized.ToString('o')
-}
-
-function Set-ScheduleMarker {
-    $state = Get-WindowsRebootState
-    if (-not $state) { return }
-    $path = Get-ScheduleMarkerPath
-    if (-not (Test-Path -LiteralPath $path)) { New-Item -Path $path -Force | Out-Null }
-    Set-ItemProperty -LiteralPath $path -Name RecognitionTime -Value $state.Recognized.ToString('o')
+function Get-ScheduledRebootProperty($Item, [string[]]$Names) {
+    if (-not $Item) { return $null }
+    foreach ($name in $Names) {
+        if ($Item.PSObject.Properties.Name -notcontains $name) { continue }
+        $value = $Item.$name
+        if ($null -eq $value -or [string]$value -eq '' -or [string]$value -eq '0') { continue }
+        $asNumber = 0L
+        if ([int64]::TryParse([string]$value, [ref]$asNumber) -and $asNumber -eq 1 -and $name -match '(?i)schedul|ByUser|Enabled') {
+            return 'the time you picked'
+        }
+        $when = Test-FutureRestartTime $value
+        if ($when) { return $when }
+    }
+    return $null
 }
 
 function Get-ScheduledUpdateRestart {
-    # A time the user picked in the Windows Update schedule menu, or a reboot task Windows has armed.
-    # SmartSchedulerPredicted* is only a guess, so it does not count.
+    # Read only what Windows stored. Do not remember that the schedule page was opened.
+    # SmartSchedulerPredicted* is a guess until Windows marks it committed (confidence 100).
+    $directNames = @(
+        'ScheduledRebootTime', 'ScheduledRebootTimeInUTC', 'RebootScheduledTime', 'RebootTime',
+        'UserRebootTime', 'LastRebootScheduledTime', 'RebootRequiredTime', 'CustomRestartTime',
+        'ScheduleRestartTime', 'RebootScheduled', 'RebootScheduledByUser', 'IsRebootScheduled',
+        'RebootScheduleEnabled', 'IsScheduleRestartEnabled', 'ScheduleRestart'
+    )
+    foreach ($directPath in @(
+        'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings',
+        'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\StateVariables',
+        'HKCU:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+    )) {
+        if (-not (Test-Path -LiteralPath $directPath)) { continue }
+        $hit = Get-ScheduledRebootProperty (Get-ItemProperty -LiteralPath $directPath -ErrorAction SilentlyContinue) $directNames
+        if ($hit) { return $hit }
+    }
     $statePath = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\StateVariables'
     if (Test-Path -LiteralPath $statePath) {
         $state = Get-ItemProperty -LiteralPath $statePath -ErrorAction SilentlyContinue
@@ -894,10 +905,7 @@ if (-not $Preview) {
         Write-Output 'OK: no update restart is pending, so the prompt was not shown'
         exit 0
     }
-    if (Test-ScheduleMarker) {
-        Write-Output 'OK: this pending restart was already sent to the Windows schedule page, so the prompt was not shown'
-        exit 0
-    }
+    Remove-Item -LiteralPath 'HKCU:\Software\UpdateRestartPrompt' -Recurse -Force -ErrorAction SilentlyContinue
     $scheduledRestart = Get-ScheduledUpdateRestart
     if ($scheduledRestart) {
         Write-Output ('OK: a restart is already scheduled for {0}, so the prompt was not shown' -f $scheduledRestart)
@@ -1068,7 +1076,6 @@ try {
         $ui.ErrorText.Visibility = 'Collapsed'
         try {
             Open-SettingsPage 'ms-settings:windowsupdate-restartoptions'
-            Set-ScheduleMarker
         } catch {
             try { Open-SettingsPage 'ms-settings:windowsupdate' } catch { }
             Show-DialogError 'The schedule picker could not be opened directly. Use the arrow beside Restart now.'
