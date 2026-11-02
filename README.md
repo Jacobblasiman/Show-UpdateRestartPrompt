@@ -2,7 +2,7 @@
 
 Shows a restart prompt when Windows Update is waiting on a restart to finish installing updates. If no update restart is pending, the script exits without showing anything.
 
-It tries the built-in engaged-restart dialog first (`MusNotificationUx.exe`). Current Windows 11 builds usually do not raise that dialog on demand. When it does not appear, the script shows a Windows 11-style card with **Restart now**, **Schedule restart**, and **Close**.
+The card is shown at the bottom-right of the screen. The built-in engaged-restart dialog is not used, because Windows always opens that dialog in the center and it cannot be moved.
 
 The card appears at the bottom-right of the screen. **Schedule restart** opens the native picker and leaves a closeable guide in that corner. The guide explains the picker: turn on **Schedule a time**, choose **Pick a day** and **Pick a time**, then confirm. The PC has to be powered on, awake, and online at that time. The restart cannot be scheduled during downtime. Close dismisses the guide.
 

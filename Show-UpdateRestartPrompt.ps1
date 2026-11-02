@@ -12,10 +12,11 @@
     Current Windows 11 builds usually will not raise that dialog on demand. When it does not appear,
     this script shows a close copy with Restart now, Schedule restart, and Close.
 
-    The prompt appears at the bottom-right of the screen. Schedule restart opens the native
-    picker and turns this prompt into a closeable corner guide. The guide does not wait on
-    Settings and does not lock the screen. It explains the picker and tells the user to choose
-    a time when the PC will be on, awake, and online. The restart cannot be scheduled during downtime.
+    The built-in engaged dialog always opens in the center and cannot be moved, so this script
+    does not launch it. The card is placed at the bottom-right before it is shown. Schedule
+    restart opens the native picker and turns the card into a closeable corner guide. The
+    restart must be at a time when the PC will be on, awake, and online. It cannot be scheduled
+    during downtime.
 
     Run in the signed-in user's session. Intune: "Run this script using the logged-on credentials" = Yes
     and "Run script in 64-bit PowerShell" = Yes. A restart happens only if the user clicks Restart now.
@@ -336,12 +337,12 @@ if (-not $haveLock) {
 }
 
 try {
-    if (-not $Preview) {
-        if (Try-ShowNativeEngagedDialog) {
-            Write-Output 'Shown: native engaged restart dialog'
-            exit 0
-        }
-        Write-Output ('Native engaged restart dialog did not appear ({0}); showing the recreated prompt' -f $restartReason)
+    # Do not launch MusNotificationUx. That dialog is centered and cannot be moved,
+    # so the corner card would never appear on machines where it still opens.
+    if ($Preview) {
+        Write-Output 'Preview: showing the corner restart prompt'
+    } else {
+        Write-Output ('Showing the corner restart prompt ({0})' -f $restartReason)
     }
 
     Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
@@ -393,16 +394,24 @@ try {
 
     $script:Choice = $null
     $script:OpenedPicker = $false
+    $script:PinCorner = $true
+    $script:MovingWindow = $false
 
     function Move-ToBottomRight {
-        $window.UpdateLayout()
-        $area = [System.Windows.SystemParameters]::WorkArea
-        $width = $window.ActualWidth
-        $height = $window.ActualHeight
-        if ($width -lt 1) { $width = $window.Width + 40 }
-        if ($height -lt 1) { $height = 360 }
-        $window.Left = [Math]::Max($area.Left, $area.Right - $width - 12)
-        $window.Top = [Math]::Max($area.Top, $area.Bottom - $height - 12)
+        if (-not $script:PinCorner -or $script:MovingWindow) { return }
+        $script:MovingWindow = $true
+        try {
+            $window.UpdateLayout()
+            $area = [System.Windows.SystemParameters]::WorkArea
+            $width = $window.ActualWidth
+            $height = $window.ActualHeight
+            if ($width -lt 1) { $width = $window.Width + 40 }
+            if ($height -lt 1) { $height = 220 }
+            $window.Left = [Math]::Max($area.Left, $area.Right - $width - 16)
+            $window.Top = [Math]::Max($area.Top, $area.Bottom - $height - 16)
+        } finally {
+            $script:MovingWindow = $false
+        }
     }
 
     function Show-DialogError([string]$Message) {
@@ -477,13 +486,28 @@ try {
         $window.Close()
     })
 
-    $window.Add_MouseLeftButtonDown({ try { $window.DragMove() } catch { } })
+    $window.Add_MouseLeftButtonDown({
+        $script:PinCorner = $false
+        try { $window.DragMove() } catch { }
+    })
+    $window.Add_SizeChanged({ Move-ToBottomRight })
     $window.Add_Loaded({
         Move-ToBottomRight
         [void]$window.Activate()
         [void]$ui.CloseBtn.Focus()
     })
-    $window.Add_ContentRendered({ Move-ToBottomRight })
+    $window.Add_ContentRendered({
+        Move-ToBottomRight
+        # SizeToContent recenters a Manual window after the first layout. Pin the corner, then allow height to follow the text.
+        $window.Dispatcher.BeginInvoke([Action]{
+            Move-ToBottomRight
+        }, [Windows.Threading.DispatcherPriority]::ApplicationIdle) | Out-Null
+    })
+
+    # First frame is already in the corner. Unset Left/Top makes WPF choose the center.
+    $workArea = [System.Windows.SystemParameters]::WorkArea
+    $window.Left = [Math]::Max($workArea.Left, $workArea.Right - ($window.Width + 40) - 16)
+    $window.Top = [Math]::Max($workArea.Top, $workArea.Bottom - 240 - 16)
     $window.Add_Closing({ if (-not $script:Choice) { $script:Choice = 'Close' } })
 
     [void]$window.ShowDialog()
