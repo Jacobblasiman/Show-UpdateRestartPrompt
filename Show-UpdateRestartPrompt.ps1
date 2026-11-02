@@ -33,7 +33,7 @@
 #>
 param([switch]$Preview)
 
-$ScriptVersion = '1.5'
+$ScriptVersion = '1.6'
 
 $ErrorActionPreference = 'Stop'
 
@@ -214,15 +214,39 @@ function Format-Duration([TimeSpan]$Span) {
 }
 
 function Get-RebootRequiredUpdates {
+    $updates = @()
     try {
         $searcher = (New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher()
-        $result = $searcher.Search('IsInstalled=1 and RebootRequired=1')
-        $updates = @()
-        foreach ($update in $result.Updates) { $updates += $update }
-        return $updates
+        foreach ($criteria in @('IsInstalled=1 and RebootRequired=1', 'IsInstalled=0 and RebootRequired=1')) {
+            try {
+                $result = $searcher.Search($criteria)
+                foreach ($update in $result.Updates) { $updates += $update }
+            } catch { }
+        }
+    } catch { }
+    if ($updates.Count -gt 0) { return $updates }
+
+    # The agent often will not list the update even though it logged that a restart is required.
+    # The event text names the KB, which is enough to tell a quality update from a feature update.
+    try {
+        $boot = (Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime
+        $events = @(Get-WinEvent -FilterHashtable @{
+            LogName = 'Microsoft-Windows-WindowsUpdateClient/Operational'
+            Id = 21, 22
+            StartTime = $boot
+        } -ErrorAction Stop)
     } catch {
         return @()
     }
+    foreach ($event in $events) {
+        $message = [string]$event.Message
+        $ids = @()
+        foreach ($match in [regex]::Matches($message, 'KB(\d{6,8})')) { $ids += $match.Groups[1].Value }
+        $title = ($message -split "`r?`n" | Where-Object { $_ -match '\S' } | Select-Object -First 1)
+        if (-not $title) { $title = 'Windows Update' }
+        $updates += [pscustomobject]@{ Title = [string]$title; KBArticleIDs = $ids; Categories = @() }
+    }
+    return $updates
 }
 
 function Get-UpdateKind($Update) {
@@ -236,8 +260,10 @@ function Get-UpdateKind($Update) {
 }
 
 function Get-PendingRestartTime {
-    # The grace period starts when Windows records that a restart is pending, not when the key was last touched.
+    # Grace starts when the restart became pending. Use the earliest time Windows recorded for this boot.
     $recorded = @()
+    $boot = $null
+    try { $boot = (Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime } catch { }
     $ux = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'
     if (Test-Path -LiteralPath $ux) {
         $item = Get-ItemProperty -LiteralPath $ux
@@ -246,22 +272,51 @@ function Get-PendingRestartTime {
             if ($parsed) { $recorded += $parsed }
         }
     }
+    foreach ($path in @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\PackagesPending'
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Services\Pending'
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\RebootRequired'
+    )) {
+        if (Test-Path -LiteralPath $path) { $recorded += (Get-Item -LiteralPath $path).LastWriteTime }
+    }
     try {
-        $boot = (Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime
+        $since = if ($boot) { $boot } else { (Get-Date).AddDays(-30) }
         $events = @(Get-WinEvent -FilterHashtable @{
             LogName = 'Microsoft-Windows-WindowsUpdateClient/Operational'
             Id = 21, 22
-            StartTime = $boot
+            StartTime = $since
         } -ErrorAction Stop)
         if ($events.Count -gt 0) {
             $recorded += ($events | Sort-Object TimeCreated | Select-Object -First 1).TimeCreated
         }
     } catch { }
+    if ($boot) { $recorded = @($recorded | Where-Object { $_ -ge $boot.AddMinutes(-5) }) }
     if ($recorded.Count -eq 0) { return $null }
-    $earliest = $recorded | Sort-Object | Select-Object -First 1
-    $latest = $recorded | Sort-Object | Select-Object -Last 1
-    if (($latest - $earliest).TotalMinutes -gt 2) { return @{ Conflict = $true } }
-    return @{ Conflict = $false; Time = $earliest }
+    $sorted = @($recorded | Sort-Object)
+    $earliest = $sorted[0]
+    $latest = $sorted[$sorted.Count - 1]
+    return @{ Time = $earliest; SpreadMinutes = ($latest - $earliest).TotalMinutes }
+}
+
+function Get-EarliestOfferTime([datetime]$RestartTime, [int]$DeadlineDays) {
+    try {
+        $events = @(Get-WinEvent -FilterHashtable @{
+            LogName = 'Microsoft-Windows-WindowsUpdateClient/Operational'
+            StartTime = $RestartTime.AddDays(-1 * ([Math]::Max($DeadlineDays, 1) + 14))
+        } -ErrorAction Stop)
+    } catch {
+        return $null
+    }
+    $found = @()
+    foreach ($event in $events) {
+        if ($event.Id -in 19, 20, 21, 22, 43) { continue }
+        if ([string]$event.Message -notmatch '(?i)found|detected|offered|available') { continue }
+        if ($event.TimeCreated -le $RestartTime.AddMinutes(5)) { $found += $event.TimeCreated }
+    }
+    if ($found.Count -eq 0) { return $null }
+    return ($found | Sort-Object | Select-Object -First 1)
 }
 
 function Get-UpdateOfferTime($Update, [datetime]$RestartTime) {
@@ -310,26 +365,18 @@ function Get-ForcedRestart {
         return @{ Text = 'No deadline policy is enforced on this device, so Windows has not set a forced-restart time.' }
     }
 
-    $updates = @(Get-RebootRequiredUpdates)
-    if ($updates.Count -eq 0) {
-        return @{ Text = 'Windows Update did not identify which installed update is waiting on the restart, so the forced-restart time is not shown.' }
-    }
-
     $restart = Get-PendingRestartTime
     if (-not $restart) {
         return @{ Text = 'Windows did not record when this restart became pending, so the forced-restart time is not shown.' }
     }
-    if ($restart.Conflict) {
-        return @{ Text = 'Windows recorded more than one start time for this pending restart, so the forced-restart time is not shown.' }
-    }
 
+    $updates = @(Get-RebootRequiredUpdates)
     $bindings = @()
+    $unnamed = $false
     foreach ($update in $updates) {
         $kind = Get-UpdateKind $update
         if ($kind -eq 'Driver') { continue }
-        if ($kind -ne 'Feature' -and $kind -ne 'Quality') {
-            return @{ Text = 'The pending update is not a quality or feature update, so the Intune deadline does not give a forced-restart time.' }
-        }
+        if ($kind -ne 'Feature' -and $kind -ne 'Quality') { continue }
         $deadlinePolicy = if ($kind -eq 'Feature') { $featureDeadline } else { $qualityDeadline }
         if (-not $deadlinePolicy) {
             return @{ Text = "The pending $kind update has no enforced deadline, so the forced-restart time is not shown." }
@@ -343,9 +390,7 @@ function Get-ForcedRestart {
         $offer = $null
         if ($graceDays -lt $deadlineDays) {
             $offer = Get-UpdateOfferTime $update $restart.Time
-            if (-not $offer) {
-                return @{ Text = 'Windows did not record when this update was offered. That time is required for this deadline, so the forced-restart time is not shown.' }
-            }
+            if (-not $offer) { continue }
         }
         $graceEnd = $restart.Time.AddDays($graceDays)
         if ($null -ne $offer) {
@@ -359,7 +404,33 @@ function Get-ForcedRestart {
     }
 
     if ($bindings.Count -eq 0) {
-        return @{ Text = 'No quality or feature update is waiting on this restart, so the Intune deadline does not give a forced-restart time.' }
+        # The update was not named, or its offer time was not recorded. Calculate each enforced
+        # policy and show the soonest cutoff Windows is allowed to use.
+        $unnamed = $true
+        foreach ($kind in @('Quality', 'Feature')) {
+            $deadlinePolicy = if ($kind -eq 'Feature') { $featureDeadline } else { $qualityDeadline }
+            $gracePolicy = if ($kind -eq 'Feature') { $featureGrace } else { $qualityGrace }
+            if (-not $deadlinePolicy -or -not $gracePolicy) { continue }
+            $deadlineDays = [int]$deadlinePolicy.Value
+            $graceDays = [int]$gracePolicy.Value
+            $graceEnd = $restart.Time.AddDays($graceDays)
+            if ($graceDays -ge $deadlineDays) {
+                $bindings += @{ Effective = $graceEnd; Start = $restart.Time; Days = $graceDays; Kind = $kind; DeadlineDays = $deadlineDays; GraceDays = $graceDays; Source = $gracePolicy.Source }
+                continue
+            }
+            $offer = Get-EarliestOfferTime $restart.Time $deadlineDays
+            if (-not $offer) { continue }
+            $offerEnd = $offer.AddDays($deadlineDays)
+            if ($offerEnd -gt $graceEnd) {
+                $bindings += @{ Effective = $offerEnd; Start = $offer; Days = $deadlineDays; Kind = $kind; DeadlineDays = $deadlineDays; GraceDays = $graceDays; Source = $deadlinePolicy.Source }
+            } else {
+                $bindings += @{ Effective = $graceEnd; Start = $restart.Time; Days = $graceDays; Kind = $kind; DeadlineDays = $deadlineDays; GraceDays = $graceDays; Source = $gracePolicy.Source }
+            }
+        }
+    }
+
+    if ($bindings.Count -eq 0) {
+        return @{ Text = 'A restart is required, but the enforced deadline could not be calculated from the policy on this device.' }
     }
     $binding = $bindings | Sort-Object { $_.Effective } | Select-Object -First 1
     $now = Get-Date
@@ -373,6 +444,12 @@ function Get-ForcedRestart {
     $when = '{0} at {1}' -f $binding.Effective.ToString('dddd, MMMM d, yyyy'), $binding.Effective.ToString('t')
     $kindName = if ($binding.Kind -eq 'Feature') { 'feature' } else { 'quality' }
     $policyLine = '{0} is enforcing a {1}-day {2}-update deadline and a {3}-day grace period. The cutoff is the later of those two clocks.' -f $binding.Source, $binding.DeadlineDays, $kindName, $binding.GraceDays
+    if ($unnamed) {
+        $policyLine += ' The pending update was not named, so this is the soonest cutoff of the enforced policies.'
+    }
+    if ($restart.SpreadMinutes -gt 2) {
+        $policyLine += ' Windows recorded more than one start time; the earlier one is used.'
+    }
     if ($noAutoReboot -and [int]$noAutoReboot.Value -eq 0) {
         $policyLine += ' Windows may still restart outside active hours before that cutoff.'
     }
