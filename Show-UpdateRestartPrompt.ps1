@@ -33,7 +33,7 @@
 #>
 param([switch]$Preview)
 
-$ScriptVersion = '1.18'
+$ScriptVersion = '1.19'
 
 $ErrorActionPreference = 'Stop'
 
@@ -824,20 +824,21 @@ function Get-ScheduledUpdateRestart {
     $statePath = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\StateVariables'
     if (Test-Path -LiteralPath $statePath) {
         $state = Get-ItemProperty -LiteralPath $statePath -ErrorAction SilentlyContinue
-        # The schedule picker writes the chosen day and time here. Windows also puts a same-day
-        # guess in this value, so only a start more than 12 hours away counts as a queued restart.
-        if ($state -and $state.PSObject.Properties.Name -contains 'SmartSchedulerPredictedStartTimePoint') {
-            $picked = ConvertFrom-UnixMilliseconds $state.SmartSchedulerPredictedStartTimePoint
-            if ($picked -and $picked -gt (Get-Date).AddHours(12)) { return $picked }
+        # The schedule picker writes the chosen restart into this value. A future time means
+        # Windows already has the restart queued, so the prompt must stay hidden.
+        if ($state) {
+            foreach ($name in @('SmartSchedulerPredictedStartTimePoint', 'SmartSchedulerPredictedEndTimePoint')) {
+                if ($state.PSObject.Properties.Name -notcontains $name) { continue }
+                $picked = ConvertFrom-UnixMilliseconds $state.$name
+                if (-not $picked) { $picked = Test-FutureRestartTime $state.$name }
+                if ($picked -and $picked -gt (Get-Date)) { return $picked }
+            }
         }
     }
     $ignore = @(
         'CurrentRebootRecognitionTime'
         'IsCurrentRebootFeature'
-        'SmartSchedulerPredictedStartTimePoint'
-        'SmartSchedulerPredictedEndTimePoint'
         'SmartSchedulerPredictedConfidence'
-        'RebootDowntimeEvaluation'
         'DepOobeCompleteScheduler'
         'PostUpdateOobeAppsScanScheduler'
     )
@@ -857,7 +858,7 @@ function Get-ScheduledUpdateRestart {
             foreach ($property in $item.PSObject.Properties) {
                 if ($property.Name -match '^(PS|$)') { continue }
                 if ($ignore -contains $property.Name) { continue }
-                if ($property.Name -match '(?i)SmartScheduler|Oobe|Downtime|Confidence|Recognition|ActiveHours|Notification') { continue }
+                if ($property.Name -match '(?i)^SmartScheduler|^IsCurrent|Oobe|Confidence|Recognition|ActiveHours|Notification') { continue }
                 $keyIsSchedule = $key.PSPath -match '(?i)\\(Reboot|Restart|Schedule)(\\|$)'
                 $scheduledName = $property.Name -match '(?i)schedul|reboot|restart'
                 $timeUnderScheduleKey = $keyIsSchedule -and $property.Name -match '(?i)^(Time|Start|End|StartTime|Date|Value|Data|Enabled)$'
