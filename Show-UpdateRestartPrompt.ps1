@@ -33,7 +33,7 @@
 #>
 param([switch]$Preview)
 
-$ScriptVersion = '1.14'
+$ScriptVersion = '1.15'
 
 $ErrorActionPreference = 'Stop'
 
@@ -849,15 +849,6 @@ function Get-ScheduledUpdateRestart {
             }
         }
     } catch { }
-    foreach ($taskName in @('\Microsoft\Windows\UpdateOrchestrator\Reboot', '\Microsoft\Windows\UpdateOrchestrator\Reboot_AC', '\Microsoft\Windows\UpdateOrchestrator\Reboot_Battery')) {
-        $query = & "$env:SystemRoot\System32\schtasks.exe" /Query /TN $taskName /FO LIST /V 2>$null
-        if (-not $query) { continue }
-        foreach ($line in $query) {
-            if ($line -notmatch '(?i)Next Run Time:\s*(.+)$') { continue }
-            $when = ConvertTo-LocalDate $Matches[1].Trim()
-            if ($when -and $when -gt $now -and $when.Year -lt 2100) { return $when }
-        }
-    }
     return $null
 }
 
