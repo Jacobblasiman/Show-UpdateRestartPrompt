@@ -33,7 +33,7 @@
 #>
 param([switch]$Preview)
 
-$ScriptVersion = '1.11'
+$ScriptVersion = '1.12'
 
 $ErrorActionPreference = 'Stop'
 
@@ -774,6 +774,39 @@ function Get-AccentColor {
     }
 }
 
+function Get-ScheduledUpdateRestart {
+    # A future time Windows has already committed to. The smart-scheduler prediction is not a schedule.
+    $names = @('ScheduledRebootTime', 'RebootScheduledTime', 'UserScheduledRebootTime', 'ScheduledRebootTimePoint')
+    $paths = @(
+        'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\StateVariables'
+        'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator'
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\Reboot'
+    )
+    $now = Get-Date
+    foreach ($path in $paths) {
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        $item = Get-ItemProperty -LiteralPath $path -ErrorAction SilentlyContinue
+        if (-not $item) { continue }
+        foreach ($property in $item.PSObject.Properties) {
+            if ($names -notcontains $property.Name -and $property.Name -notmatch '^(ScheduledReboot|RebootScheduled|UserScheduledReboot)') { continue }
+            $when = ConvertFrom-UnixMilliseconds $property.Value
+            if (-not $when) { $when = ConvertTo-LocalDate $property.Value }
+            if ($when -and $when -gt $now) { return $when }
+        }
+    }
+    try {
+        $tasks = @(Get-ScheduledTask -TaskPath '\Microsoft\Windows\UpdateOrchestrator\' -ErrorAction Stop | Where-Object { $_.TaskName -match '^Reboot' })
+        foreach ($task in $tasks) {
+            $info = Get-ScheduledTaskInfo -InputObject $task -ErrorAction SilentlyContinue
+            if ($info -and $info.NextRunTime -and $info.NextRunTime.Year -gt 2000 -and $info.NextRunTime.Year -lt 2100 -and $info.NextRunTime -gt $now) {
+                return $info.NextRunTime
+            }
+        }
+    } catch { }
+    return $null
+}
+
 if (-not $Preview) {
     if (-not (Test-InteractiveUser)) {
         Write-Output 'Error: run this in the signed-in user session so the prompt can be shown'
@@ -782,6 +815,11 @@ if (-not $Preview) {
     $restartReason = Get-UpdateRestartReason
     if (-not $restartReason) {
         Write-Output 'OK: no update restart is pending, so the prompt was not shown'
+        exit 0
+    }
+    $scheduledRestart = Get-ScheduledUpdateRestart
+    if ($scheduledRestart) {
+        Write-Output ('OK: a restart is already scheduled for {0:g}, so the prompt was not shown' -f $scheduledRestart)
         exit 0
     }
 }
