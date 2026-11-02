@@ -33,7 +33,7 @@
 #>
 param([switch]$Preview)
 
-$ScriptVersion = '1.17'
+$ScriptVersion = '1.18'
 
 $ErrorActionPreference = 'Stop'
 
@@ -824,10 +824,11 @@ function Get-ScheduledUpdateRestart {
     $statePath = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\StateVariables'
     if (Test-Path -LiteralPath $statePath) {
         $state = Get-ItemProperty -LiteralPath $statePath -ErrorAction SilentlyContinue
-        if ($state -and $state.PSObject.Properties.Name -contains 'SmartSchedulerPredictedConfidence' -and [int]$state.SmartSchedulerPredictedConfidence -ge 100) {
+        # The schedule picker writes the chosen day and time here. Windows also puts a same-day
+        # guess in this value, so only a start more than 12 hours away counts as a queued restart.
+        if ($state -and $state.PSObject.Properties.Name -contains 'SmartSchedulerPredictedStartTimePoint') {
             $picked = ConvertFrom-UnixMilliseconds $state.SmartSchedulerPredictedStartTimePoint
-            if ($picked -and $picked -gt (Get-Date)) { return $picked }
-            return 'the time you picked'
+            if ($picked -and $picked -gt (Get-Date).AddHours(12)) { return $picked }
         }
     }
     $ignore = @(
