@@ -33,7 +33,7 @@
 #>
 param([switch]$Preview)
 
-$ScriptVersion = '1.3'
+$ScriptVersion = '1.4'
 
 $ErrorActionPreference = 'Stop'
 
@@ -93,6 +93,253 @@ function Get-UpdateRestartReason {
         return $null
     }
     return $null
+}
+
+function Get-EnforcedDword([string]$Name) {
+    # Intune writes the winning value under PolicyManager. A value counts only when a provider owns it.
+    # Group Policy writes the same names under the WindowsUpdate policy key. If those two disagree,
+    # there is no single enforced number.
+    $mdmPath = 'HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\Update'
+    $gpoPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+    $mdm = $null
+    $provider = $null
+    if (Test-Path -LiteralPath $mdmPath) {
+        $item = Get-ItemProperty -LiteralPath $mdmPath
+        if ($item.PSObject.Properties.Name -contains $Name) {
+            $mdm = [int]$item.$Name
+            $providerName = $Name + '_WinningProvider'
+            if ($item.PSObject.Properties.Name -contains $providerName) {
+                $provider = [string]$item.$providerName
+            }
+        }
+    }
+    $gpo = $null
+    if (Test-Path -LiteralPath $gpoPath) {
+        $item = Get-ItemProperty -LiteralPath $gpoPath
+        if ($item.PSObject.Properties.Name -contains $Name) { $gpo = [int]$item.$Name }
+    }
+    $mdmEnforced = ($null -ne $mdm -and -not [string]::IsNullOrWhiteSpace($provider))
+    if ($mdmEnforced -and $null -ne $gpo -and $gpo -ne $mdm) {
+        return @{ Conflict = $true }
+    }
+    if ($mdmEnforced) { return @{ Conflict = $false; Value = $mdm; Source = 'Intune' } }
+    if ($null -ne $gpo) { return @{ Conflict = $false; Value = $gpo; Source = 'Group Policy' } }
+    return $null
+}
+
+function ConvertTo-LocalDate($Value) {
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [datetime]) {
+        $date = $Value
+    } elseif ($Value -is [byte[]]) {
+        return $null
+    } else {
+        $number = 0L
+        if ([int64]::TryParse([string]$Value, [ref]$number) -and $number -gt 10000000000000000) {
+            try { return [datetime]::FromFileTime($number) } catch { return $null }
+        }
+        $parsed = [datetime]::MinValue
+        $styles = [Globalization.DateTimeStyles]::RoundtripKind -bor [Globalization.DateTimeStyles]::AllowWhiteSpaces
+        if (-not [datetime]::TryParse([string]$Value, [Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$parsed)) {
+            return $null
+        }
+        $date = $parsed
+    }
+    if ($date.Year -lt 2020 -or $date.Year -gt 2100) { return $null }
+    if ($date.Kind -eq [DateTimeKind]::Utc) { return $date.ToLocalTime() }
+    return $date
+}
+
+function Format-Duration([TimeSpan]$Span) {
+    if ($Span.TotalSeconds -lt 0) { $Span = [TimeSpan]::Zero }
+    if ($Span.TotalMinutes -lt 1) { return 'less than a minute' }
+    $days = [int][Math]::Floor($Span.TotalDays)
+    $hours = $Span.Hours
+    $minutes = $Span.Minutes
+    $parts = @()
+    if ($days -eq 1) { $parts += '1 day' } elseif ($days -gt 1) { $parts += "$days days" }
+    if ($hours -eq 1) { $parts += '1 hour' } elseif ($hours -gt 1) { $parts += "$hours hours" }
+    if ($days -eq 0 -and $minutes -gt 0) {
+        if ($minutes -eq 1) { $parts += '1 minute' } else { $parts += "$minutes minutes" }
+    }
+    if ($parts.Count -eq 0) { return 'less than a minute' }
+    return ($parts -join ' ')
+}
+
+function Get-RebootRequiredUpdates {
+    try {
+        $searcher = (New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher()
+        $result = $searcher.Search('IsInstalled=1 and RebootRequired=1')
+        $updates = @()
+        foreach ($update in $result.Updates) { $updates += $update }
+        return $updates
+    } catch {
+        return @()
+    }
+}
+
+function Get-UpdateKind($Update) {
+    $names = @()
+    try { foreach ($category in $Update.Categories) { $names += [string]$category.Name } } catch { }
+    $title = [string]$Update.Title
+    if (($names -contains 'Upgrades') -or ($names -contains 'Feature Packs') -or ($title -match '^Feature update')) { return 'Feature' }
+    if (($names -contains 'Drivers') -or ($title -match 'driver')) { return 'Driver' }
+    if (($names -contains 'Security Updates') -or ($names -contains 'Critical Updates') -or ($names -contains 'Update Rollups') -or ($names -contains 'Updates') -or ($title -match 'Cumulative|\.NET')) { return 'Quality' }
+    return 'Other'
+}
+
+function Get-PendingRestartTime {
+    # The grace period starts when Windows records that a restart is pending, not when the key was last touched.
+    $recorded = @()
+    $ux = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'
+    if (Test-Path -LiteralPath $ux) {
+        $item = Get-ItemProperty -LiteralPath $ux
+        if ($item.PSObject.Properties.Name -contains 'PendingRebootStartTime') {
+            $parsed = ConvertTo-LocalDate $item.PendingRebootStartTime
+            if ($parsed) { $recorded += $parsed }
+        }
+    }
+    try {
+        $boot = (Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime
+        $events = @(Get-WinEvent -FilterHashtable @{
+            LogName = 'Microsoft-Windows-WindowsUpdateClient/Operational'
+            Id = 21, 22
+            StartTime = $boot
+        } -ErrorAction Stop)
+        if ($events.Count -gt 0) {
+            $recorded += ($events | Sort-Object TimeCreated | Select-Object -First 1).TimeCreated
+        }
+    } catch { }
+    if ($recorded.Count -eq 0) { return $null }
+    $earliest = $recorded | Sort-Object | Select-Object -First 1
+    $latest = $recorded | Sort-Object | Select-Object -Last 1
+    if (($latest - $earliest).TotalMinutes -gt 2) { return @{ Conflict = $true } }
+    return @{ Conflict = $false; Time = $earliest }
+}
+
+function Get-UpdateOfferTime($Update, [datetime]$RestartTime) {
+    $needles = @()
+    try { foreach ($kb in $Update.KBArticleIDs) { if ($kb) { $needles += [string]$kb } } } catch { }
+    if ($needles.Count -eq 0) { return $null }
+    try {
+        $events = @(Get-WinEvent -FilterHashtable @{
+            LogName = 'Microsoft-Windows-WindowsUpdateClient/Operational'
+            StartTime = $RestartTime.AddDays(-45)
+        } -ErrorAction Stop)
+    } catch {
+        return $null
+    }
+    $found = @()
+    foreach ($event in $events) {
+        if ($event.Id -in 19, 20, 21, 22, 43) { continue }
+        $message = [string]$event.Message
+        if ($message -notmatch '(?i)found|detected|offered|available') { continue }
+        $hit = $false
+        foreach ($needle in $needles) {
+            if ($message.Contains($needle)) { $hit = $true; break }
+        }
+        if ($hit -and $event.TimeCreated -le $RestartTime.AddMinutes(5)) { $found += $event.TimeCreated }
+    }
+    if ($found.Count -eq 0) { return $null }
+    return ($found | Sort-Object | Select-Object -First 1)
+}
+
+function Get-ForcedRestart {
+    # Microsoft's rule for the policies Intune enforces:
+    # effective cutoff = the later of (scan discovery + deadline days) and (restart pending + grace days).
+    # https://learn.microsoft.com/en-us/windows/deployment/update/wufb-compliancedeadlines
+    # A missing policy is not treated as Microsoft's CSP default. An assumed default would not be the enforced value.
+    $qualityDeadline = Get-EnforcedDword 'ConfigureDeadlineForQualityUpdates'
+    $featureDeadline = Get-EnforcedDword 'ConfigureDeadlineForFeatureUpdates'
+    $qualityGrace = Get-EnforcedDword 'ConfigureDeadlineGracePeriod'
+    $featureGrace = Get-EnforcedDword 'ConfigureDeadlineGracePeriodForFeatureUpdates'
+    $noAutoReboot = Get-EnforcedDword 'ConfigureDeadlineNoAutoReboot'
+    foreach ($policy in @($qualityDeadline, $featureDeadline, $qualityGrace, $featureGrace, $noAutoReboot)) {
+        if ($policy -and $policy.Conflict) {
+            return @{ Text = 'The Intune deadline and the local Windows Update policy do not match, so no forced-restart time is shown.' }
+        }
+    }
+    if (-not $qualityDeadline -and -not $featureDeadline) {
+        return @{ Text = 'No deadline policy is enforced on this device, so Windows has not set a forced-restart time.' }
+    }
+
+    $updates = @(Get-RebootRequiredUpdates)
+    if ($updates.Count -eq 0) {
+        return @{ Text = 'Windows Update did not identify which installed update is waiting on the restart, so the forced-restart time is not shown.' }
+    }
+
+    $restart = Get-PendingRestartTime
+    if (-not $restart) {
+        return @{ Text = 'Windows did not record when this restart became pending, so the forced-restart time is not shown.' }
+    }
+    if ($restart.Conflict) {
+        return @{ Text = 'Windows recorded more than one start time for this pending restart, so the forced-restart time is not shown.' }
+    }
+
+    $bindings = @()
+    foreach ($update in $updates) {
+        $kind = Get-UpdateKind $update
+        if ($kind -eq 'Driver') { continue }
+        if ($kind -ne 'Feature' -and $kind -ne 'Quality') {
+            return @{ Text = 'The pending update is not a quality or feature update, so the Intune deadline does not give a forced-restart time.' }
+        }
+        $deadlinePolicy = if ($kind -eq 'Feature') { $featureDeadline } else { $qualityDeadline }
+        if (-not $deadlinePolicy) {
+            return @{ Text = "The pending $kind update has no enforced deadline, so the forced-restart time is not shown." }
+        }
+        $gracePolicy = if ($kind -eq 'Feature') { $featureGrace } else { $qualityGrace }
+        if (-not $gracePolicy) {
+            return @{ Text = "The $kind-update grace period is not set on this device, so the forced-restart time is not shown." }
+        }
+        $deadlineDays = [int]$deadlinePolicy.Value
+        $graceDays = [int]$gracePolicy.Value
+        $offer = $null
+        if ($graceDays -lt $deadlineDays) {
+            $offer = Get-UpdateOfferTime $update $restart.Time
+            if (-not $offer) {
+                return @{ Text = 'Windows did not record when this update was offered. That time is required for this deadline, so the forced-restart time is not shown.' }
+            }
+        }
+        $graceEnd = $restart.Time.AddDays($graceDays)
+        if ($null -ne $offer) {
+            $offerEnd = $offer.AddDays($deadlineDays)
+            if ($offerEnd -gt $graceEnd) {
+                $bindings += @{ Effective = $offerEnd; Start = $offer; Days = $deadlineDays; Kind = $kind; DeadlineDays = $deadlineDays; GraceDays = $graceDays; Source = $deadlinePolicy.Source }
+                continue
+            }
+        }
+        $bindings += @{ Effective = $graceEnd; Start = $restart.Time; Days = $graceDays; Kind = $kind; DeadlineDays = $deadlineDays; GraceDays = $graceDays; Source = $gracePolicy.Source }
+    }
+
+    if ($bindings.Count -eq 0) {
+        return @{ Text = 'No quality or feature update is waiting on this restart, so the Intune deadline does not give a forced-restart time.' }
+    }
+    $binding = $bindings | Sort-Object { $_.Effective } | Select-Object -First 1
+    $now = Get-Date
+    $length = $binding.Effective - $binding.Start
+    $elapsed = $now - $binding.Start
+    $remaining = $binding.Effective - $now
+    $fraction = 1.0
+    if ($length.TotalSeconds -gt 0) {
+        $fraction = [Math]::Min(1.0, [Math]::Max(0.0, $elapsed.TotalSeconds / $length.TotalSeconds))
+    }
+    $when = '{0} at {1}' -f $binding.Effective.ToString('dddd, MMMM d, yyyy'), $binding.Effective.ToString('t')
+    $kindName = if ($binding.Kind -eq 'Feature') { 'feature' } else { 'quality' }
+    $policyLine = '{0} is enforcing a {1}-day {2}-update deadline and a {3}-day grace period. The cutoff is the later of those two clocks.' -f $binding.Source, $binding.DeadlineDays, $kindName, $binding.GraceDays
+    if ($noAutoReboot -and [int]$noAutoReboot.Value -eq 0) {
+        $policyLine += ' Windows may still restart outside active hours before that cutoff.'
+    }
+    if ($remaining.TotalSeconds -le 0) {
+        $text = "The enforced cutoff was $when. That time has passed, so Windows can force the restart at any time.`r`n$policyLine"
+        $fraction = 1.0
+    } else {
+        $text = @"
+Windows will force the restart on $when.
+$(Format-Duration $remaining) remaining. $(Format-Duration $elapsed) of the $(Format-Duration $length) enforced window has passed.
+$policyLine
+"@.Trim()
+    }
+    return @{ Text = $text; Fraction = $fraction }
 }
 
 function Get-MusNotificationUxPath {
@@ -279,6 +526,13 @@ $xaml = @'
           </Grid>
 
           <TextBlock x:Name="BodyText" TextWrapping="Wrap" LineHeight="22"/>
+          <StackPanel x:Name="DeadlinePanel" Margin="0,14,0,0" Visibility="Collapsed">
+            <TextBlock x:Name="DeadlineText" TextWrapping="Wrap" LineHeight="20" FontSize="13"/>
+            <Grid x:Name="DeadlineTrack" Height="6" Margin="0,8,0,0">
+              <Border x:Name="DeadlineTrackBorder" Background="#E5E5E5" CornerRadius="3"/>
+              <Border x:Name="DeadlineFill" HorizontalAlignment="Left" Width="0" Background="#005FB8" CornerRadius="3"/>
+            </Grid>
+          </StackPanel>
           <TextBlock x:Name="ErrorText" Foreground="#C42B1C" TextWrapping="Wrap" Margin="0,12,0,0" Visibility="Collapsed"/>
         </StackPanel>
         <TextBlock x:Name="VersionText" Grid.Row="0" HorizontalAlignment="Right" VerticalAlignment="Top"
@@ -358,7 +612,7 @@ try {
 
     $window = [Windows.Markup.XamlReader]::Parse($xaml)
     $ui = @{}
-    foreach ($name in 'ShadowBorder', 'CardBorder', 'IconGlyph', 'TitleText', 'SubtitleText', 'BodyText', 'ErrorText', 'VersionText', 'FooterBorder', 'NowBtn', 'ScheduleBtn', 'CloseBtn') {
+    foreach ($name in 'ShadowBorder', 'CardBorder', 'IconGlyph', 'TitleText', 'SubtitleText', 'BodyText', 'DeadlinePanel', 'DeadlineText', 'DeadlineTrack', 'DeadlineTrackBorder', 'DeadlineFill', 'ErrorText', 'VersionText', 'FooterBorder', 'NowBtn', 'ScheduleBtn', 'CloseBtn') {
         $ui[$name] = $window.FindName($name)
     }
 
@@ -392,6 +646,8 @@ try {
         $ui.SubtitleText.Foreground = $muted
         $ui.VersionText.Foreground = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.Color]::FromRgb(184, 184, 184))
         $ui.BodyText.Foreground = $text
+        $ui.DeadlineText.Foreground = $text
+        $ui.DeadlineTrackBorder.Background = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.Color]::FromRgb(63, 63, 63))
         foreach ($buttonName in 'ScheduleBtn', 'CloseBtn') {
             $ui[$buttonName].Background = $button
             $ui[$buttonName].Foreground = $text
@@ -403,6 +659,17 @@ try {
         $ui.SubtitleText.Text = 'Preview only. Restart now will not restart this device.'
     }
     $ui.BodyText.Text = 'To finish installing updates, this device needs to restart. Restart now, or schedule it for a time when this PC will be on, awake, and online.'
+
+    $deadline = $null
+    if (-not $Preview) { $deadline = Get-ForcedRestart }
+    if ($deadline -and $deadline.Text) {
+        $ui.DeadlineText.Text = $deadline.Text
+        $ui.DeadlinePanel.Visibility = 'Visible'
+        $script:DeadlineFraction = $deadline.Fraction
+        if ($null -ne $script:DeadlineFraction) {
+            $ui.DeadlineFill.Background = $accentBrush
+        }
+    }
 
     $script:Choice = $null
     $script:OpenedPicker = $false
@@ -509,9 +776,15 @@ try {
         [void]$ui.CloseBtn.Focus()
     })
     $window.Add_ContentRendered({
+        if ($null -ne $script:DeadlineFraction) {
+            $ui.DeadlineFill.Width = [Math]::Max(0, $ui.DeadlineTrack.ActualWidth * [double]$script:DeadlineFraction)
+        }
         Move-ToBottomRight
-        # SizeToContent recenters a Manual window after the first layout. Pin the corner, then allow height to follow the text.
+        # SizeToContent recenters a Manual window after the first layout. Pin the corner again after the text is measured.
         $window.Dispatcher.BeginInvoke([Action]{
+            if ($null -ne $script:DeadlineFraction) {
+                $ui.DeadlineFill.Width = [Math]::Max(0, $ui.DeadlineTrack.ActualWidth * [double]$script:DeadlineFraction)
+            }
             Move-ToBottomRight
         }, [Windows.Threading.DispatcherPriority]::ApplicationIdle) | Out-Null
     })
