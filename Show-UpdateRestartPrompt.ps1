@@ -33,7 +33,7 @@
 #>
 param([switch]$Preview)
 
-$ScriptVersion = '1.9'
+$ScriptVersion = '1.10'
 
 $ErrorActionPreference = 'Stop'
 
@@ -528,9 +528,6 @@ function Get-ForcedRestart {
     $when = '{0} at {1}' -f $binding.Effective.ToString('dddd, MMMM d, yyyy'), $binding.Effective.ToString('t')
     $kindName = if ($binding.Kind -eq 'Feature') { 'feature' } else { 'quality' }
     $policyLine = '{0} is enforcing a {1}-day {2}-update deadline and a {3}-day grace period. The cutoff is the later of those two clocks.' -f $binding.Source, $binding.DeadlineDays, $kindName, $binding.GraceDays
-    if ($binding.FromWindows -and $binding.Start -eq $restart.Time) {
-        $policyLine = 'Windows recorded this {0}-update restart at {1}. {2} adds a {3}-day grace period. That is the forced-restart time Windows shows.' -f $kindName, $restart.Time.ToString('g'), $binding.Source, $binding.GraceDays
-    }
     if ($unnamed) {
         $policyLine += ' The pending update was not named, so this is the soonest cutoff of the enforced policies.'
     }
