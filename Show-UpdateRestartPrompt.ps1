@@ -33,7 +33,7 @@
 #>
 param([switch]$Preview)
 
-$ScriptVersion = '1.4'
+$ScriptVersion = '1.5'
 
 $ErrorActionPreference = 'Stop'
 
@@ -77,21 +77,68 @@ function Test-InteractiveUser {
     return [Environment]::UserInteractive
 }
 
+function Test-RegistryKey([string]$Path) {
+    return (Test-Path -LiteralPath $Path)
+}
+
+function Test-NonZeroDword([string]$Path, [string]$Name) {
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    $item = Get-ItemProperty -LiteralPath $Path -ErrorAction SilentlyContinue
+    if (-not $item -or ($item.PSObject.Properties.Name -notcontains $Name)) { return $false }
+    return ([int]$item.$Name) -ne 0
+}
+
 function Get-UpdateRestartReason {
-    # Windows Update's own answer only. Do not treat PendingFileRenameOperations, RunOnce,
-    # or a CBS reboot key by itself as an update restart.
-    $rebootKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
-    if (Test-Path -LiteralPath $rebootKey) {
-        return 'Windows Update RebootRequired registry key is present'
+    # Shows as soon as Windows is waiting on a restart, including before the Intune deadline.
+    # The deadline is only displayed on the card. PendingFileRenameOperations and RunOnce are
+    # ignored: Edge and OneDrive set those without a Windows Update restart.
+    # The legacy RebootRequired key and SystemInfo.RebootRequired miss some Windows 11 restarts
+    # that servicing and Update Orchestrator record elsewhere, so every update-servicing signal is checked.
+    $checks = @(
+        @{ Label = 'Windows Update RebootRequired registry key'; Test = { Test-RegistryKey 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired' } }
+        @{ Label = 'Windows Update agent RebootRequired'; Test = {
+            try { return [bool](New-Object -ComObject Microsoft.Update.SystemInfo).RebootRequired } catch { return $false }
+        } }
+        @{ Label = 'component servicing RebootPending'; Test = { Test-RegistryKey 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending' } }
+        @{ Label = 'component servicing PackagesPending'; Test = { Test-RegistryKey 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\PackagesPending' } }
+        @{ Label = 'Windows Update servicing pending'; Test = { Test-RegistryKey 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Services\Pending' } }
+        @{ Label = 'update installer volatile reboot flag'; Test = { Test-NonZeroDword 'HKLM:\SOFTWARE\Microsoft\Updates\UpdateExeVolatile' 'Flags' } }
+        @{ Label = 'Update Orchestrator reboot marker'; Test = { Test-RegistryKey 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\RebootRequired' } }
+        @{ Label = 'Windows Update UX reboot flag'; Test = { Test-NonZeroDword 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings' 'RebootRequired' } }
+    )
+    foreach ($check in $checks) {
+        if (& $check.Test) { return $check.Label }
     }
-    try {
-        $systemInfo = New-Object -ComObject Microsoft.Update.SystemInfo
-        if ($systemInfo.RebootRequired) {
-            return 'Windows Update reports a restart is required to finish installing updates'
+
+    $ux = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'
+    if (Test-Path -LiteralPath $ux) {
+        $item = Get-ItemProperty -LiteralPath $ux -ErrorAction SilentlyContinue
+        if ($item -and ($item.PSObject.Properties.Name -contains 'PendingRebootStartTime')) {
+            $pendingSince = ConvertTo-LocalDate $item.PendingRebootStartTime
+            $boot = $null
+            try { $boot = (Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime } catch { }
+            if ($pendingSince -and ((-not $boot) -or ($pendingSince -gt $boot))) {
+                return 'Windows Update recorded PendingRebootStartTime for this boot'
+            }
         }
-    } catch {
-        return $null
     }
+
+    try {
+        $boot = (Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime
+        $events = @(Get-WinEvent -FilterHashtable @{
+            LogName = 'Microsoft-Windows-WindowsUpdateClient/Operational'
+            Id = 21, 22
+            StartTime = $boot
+        } -ErrorAction Stop)
+        if ($events.Count -gt 0) { return 'Windows Update logged a restart-required event since the last boot' }
+    } catch { }
+
+    try {
+        $searcher = (New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher()
+        $result = $searcher.Search('RebootRequired=1')
+        if ($result.Updates.Count -gt 0) { return 'Windows Update lists an update whose installation needs a restart' }
+    } catch { }
+
     return $null
 }
 
