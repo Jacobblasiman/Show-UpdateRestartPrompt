@@ -33,7 +33,7 @@
 #>
 param([switch]$Preview)
 
-$ScriptVersion = '1.7'
+$ScriptVersion = '1.8'
 
 $ErrorActionPreference = 'Stop'
 
@@ -454,7 +454,15 @@ function Get-ForcedRestart {
     if ($bindings.Count -eq 0) {
         return @{ Text = 'A restart is required, but the enforced deadline could not be calculated from the policy on this device.' }
     }
-    $binding = $bindings | Sort-Object { $_.Effective } | Select-Object -First 1
+    # Do not pipe the entries. PowerShell enumerates a hashtable, and the date is then null.
+    $binding = $null
+    foreach ($candidate in $bindings) {
+        if (-not $candidate.Effective) { continue }
+        if (-not $binding -or $candidate.Effective -lt $binding.Effective) { $binding = $candidate }
+    }
+    if (-not $binding) {
+        return @{ Text = 'A restart is required, but the enforced deadline could not be calculated from the policy on this device.' }
+    }
     $now = Get-Date
     $length = $binding.Effective - $binding.Start
     $elapsed = $now - $binding.Start
